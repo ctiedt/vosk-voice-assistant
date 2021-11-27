@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import queue
+from typing import Callable
 import sounddevice as sd
 import vosk
 import sys
 import json
 import requests
-import pyttsx3
 import random
 import configparser
+
+from assistant import Assistant
+from command import Command, CommandError
 
 API_URL = None
 TOKEN = None
@@ -21,6 +24,15 @@ def callback(indata, frames, time, status):
     if status:
         print(status, file=sys.stderr)
     q.put(bytes(indata))
+
+
+def api_request(path: str, data: str) -> Callable:
+    def func():
+        res = requests.post(f"{API_URL}{path}",
+                            data=str(data), headers={"Authorization": f"Bearer {TOKEN}"})
+        if res.status_code < 200 or res.status_code >= 300:
+            raise CommandError
+    return func
 
 
 def handle_input(text: str, engine):
@@ -71,6 +83,36 @@ def handle_input(text: str, engine):
         engine.runAndWait()
 
 
+def roll_d6():
+    die = random.randint(1, 6)
+    return f"Das Ergebnis ist {die}"
+
+
+def phrases():
+    """Returns recognized phrases until `KeyboardInterrupt` """
+    device_info = sd.query_devices(None, 'input')
+    print(device_info)
+    samplerate = int(device_info['default_samplerate'])
+
+    model = vosk.Model("model")
+
+    with sd.RawInputStream(samplerate=samplerate, blocksize=8000, dtype='int16',
+                           channels=1, callback=callback):
+        rec = vosk.KaldiRecognizer(model, samplerate)
+        try:
+            while True:
+                data = q.get()
+                if rec.AcceptWaveform(data):
+                    text = json.loads(rec.Result())["text"]
+                    # handle_input(text, engine)
+                    yield text
+                else:
+                    res = rec.PartialResult()
+                    print(f'Partial: {json.loads(res)["partial"]}')
+        except KeyboardInterrupt:
+            print("Done")
+
+
 def main():
     global API_URL
     global TOKEN
@@ -78,34 +120,16 @@ def main():
     config.read("config.ini")
     API_URL = config["HomeAssistant"]["API_URL"]
     TOKEN = config["HomeAssistant"]["TOKEN"]
-    engine = pyttsx3.init()
-    try:
-        device_info = sd.query_devices(None, 'input')
-        print(device_info)
-        samplerate = int(device_info['default_samplerate'])
 
-        model = vosk.Model("model")
+    assistant = Assistant()
+    assistant.add_command(Command("mach clemens lampe an", api_request(
+        "/api/services/light/turn_on", '{"entity_id": "light.clemens_lampe"}')))
+    assistant.add_command(Command("mach clemens lampe aus", api_request(
+        "/api/services/light/turn_off", '{"entity_id": "light.clemens_lampe"}')))
+    assistant.add_command(Command("wirf einen würfel", roll_d6))
+    assistant.add_command(Command("singe mir ein lied", lambda: "la la la"))
 
-        with sd.RawInputStream(samplerate=samplerate, blocksize=8000, dtype='int16',
-                               channels=1, callback=callback):
-            print('#' * 80)
-            print('Press Ctrl+C to stop the recording')
-            print('#' * 80)
-
-            rec = vosk.KaldiRecognizer(model, samplerate)
-            while True:
-                data = q.get()
-                if rec.AcceptWaveform(data):
-                    text = json.loads(rec.Result())["text"]
-                    handle_input(text, engine)
-                else:
-                    res = rec.PartialResult()
-                    print(f'Partial: {json.loads(res)["partial"]}')
-
-    except KeyboardInterrupt:
-        print('\nDone')
-    except Exception as e:
-        print(e)
+    assistant.run(phrases())
 
 
 if __name__ == "__main__":
